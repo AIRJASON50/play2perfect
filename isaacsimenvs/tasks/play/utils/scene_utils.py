@@ -1571,7 +1571,20 @@ def setup_scene(env) -> None:
     # 1. Generate procedural URDFs in a per-launch temp dir.
     env._tmp_asset_dir = tempfile.mkdtemp(prefix="play_assets_")
     _mesh_paths = None
-    if getattr(assets_cfg, "object_mesh_dir", None):
+    if getattr(assets_cfg, "object_recipe", ""):
+        import os as _os
+
+        from .gmt_recipe_loader import resolve_gmt_recipe, unique_mesh_paths
+
+        _root = assets_cfg.forge_releases_root or _os.environ.get("GMT_FORGE_ROOT", "")
+        if not _root:
+            raise ValueError(
+                "assets.object_recipe is set but forge_releases_root / "
+                "$GMT_FORGE_ROOT is empty; provide the forge_releases path."
+            )
+        env._gmt_recipe = resolve_gmt_recipe(assets_cfg.object_recipe, _root)
+        _mesh_paths = tuple(unique_mesh_paths(env._gmt_recipe))
+    elif getattr(assets_cfg, "object_mesh_dir", None):
         import glob as _glob
 
         _mesh_paths = tuple(

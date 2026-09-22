@@ -100,6 +100,12 @@ class AssetsCfg:
     # a None default makes isaaclab's configclass reject the str override).
     object_mesh_dir: str = ""
     object_mesh_density: float = 500.0
+    # GMT recipe (schema wuji_recipe:4): resolve the recipe's unique geoms as the
+    # object pool. Takes precedence over object_mesh_dir/paths. Empty (default) =
+    # disabled, byte-identical to the procedural/mesh path. forge_releases_root
+    # anchors the release tree (never hardcoded; falls back to $GMT_FORGE_ROOT).
+    object_recipe: str = ""
+    forge_releases_root: str = ""
 
     # Static per-material frictions (set once at asset creation, not per-reset DR).
     modify_asset_frictions: bool = True
