@@ -87,6 +87,20 @@ class AssetsCfg:
     # debug_differences/policy_rollout_isaacsim.py.
     shuffle_assets: bool = True
 
+    # Optional override: use explicit mesh files as the manipulated objects
+    # instead of the procedural handle-head pool. None (default) keeps the
+    # procedural generator and behaviour byte-identical. When set to a tuple of
+    # mesh paths (.stl/.obj), setup_scene wraps each mesh into an object URDF
+    # (trimesh-computed mass/inertia) — used to evaluate the play prior on
+    # externally-defined geoms (e.g. GMT v16 primitives).
+    object_mesh_paths: tuple[str, ...] | None = None
+    # Alternative to object_mesh_paths: a directory whose *.stl/*.obj files are
+    # used as the object pool (convenient single-string CLI override for train).
+    # Empty string = disabled (str default so Hydra accepts a path override;
+    # a None default makes isaaclab's configclass reject the str override).
+    object_mesh_dir: str = ""
+    object_mesh_density: float = 500.0
+
     # Static per-material frictions (set once at asset creation, not per-reset DR).
     modify_asset_frictions: bool = True
     robot_friction: float = 0.5

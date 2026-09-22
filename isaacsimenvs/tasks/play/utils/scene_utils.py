@@ -1514,7 +1514,9 @@ def apply_physx_material_properties(env) -> None:
         materials = view.get_material_properties()
         materials[:] = default
         if name == "object" and obj_active:
-            obj_base = float(assets_cfg.robot_friction)
+            # Object base friction uses its own cfg field (defaults to 0.5, same
+            # as robot_friction, so byte-identical unless overridden for tests).
+            obj_base = float(assets_cfg.object_friction)
             bucket_vals = torch.linspace(obj_lo, obj_hi, n_buckets) * obj_base
             bucket_idx = torch.randint(0, n_buckets, (env.num_envs,))
             per_env_obj = bucket_vals[bucket_idx]  # (N_envs,)
@@ -1568,12 +1570,34 @@ def setup_scene(env) -> None:
 
     # 1. Generate procedural URDFs in a per-launch temp dir.
     env._tmp_asset_dir = tempfile.mkdtemp(prefix="play_assets_")
-    urdf_paths, object_scales_normalized = generate_handle_head_urdfs(
-        handle_head_types=tuple(assets_cfg.handle_head_types),
-        num_per_type=assets_cfg.num_assets_per_type,
-        out_dir=env._tmp_asset_dir,
-        shuffle=assets_cfg.shuffle_assets,
-    )
+    _mesh_paths = None
+    if getattr(assets_cfg, "object_mesh_dir", None):
+        import glob as _glob
+
+        _mesh_paths = tuple(
+            sorted(_glob.glob(str(Path(assets_cfg.object_mesh_dir) / "*.stl")))
+            + sorted(_glob.glob(str(Path(assets_cfg.object_mesh_dir) / "*.obj")))
+        )
+    elif getattr(assets_cfg, "object_mesh_paths", None):
+        _mesh_paths = tuple(assets_cfg.object_mesh_paths)
+
+    if _mesh_paths:
+        # Asset override: wrap explicit meshes as the objects (byte-identical to
+        # the procedural path when no mesh override is set).
+        from .generate_objects import generate_mesh_object_urdfs
+
+        urdf_paths, object_scales_normalized = generate_mesh_object_urdfs(
+            mesh_paths=_mesh_paths,
+            out_dir=env._tmp_asset_dir,
+            density=getattr(assets_cfg, "object_mesh_density", 500.0),
+        )
+    else:
+        urdf_paths, object_scales_normalized = generate_handle_head_urdfs(
+            handle_head_types=tuple(assets_cfg.handle_head_types),
+            num_per_type=assets_cfg.num_assets_per_type,
+            out_dir=env._tmp_asset_dir,
+            shuffle=assets_cfg.shuffle_assets,
+        )
     if not urdf_paths:
         raise ValueError(
             "No procedural object URDFs were generated. "

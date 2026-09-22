@@ -399,6 +399,68 @@ def generate_handle_head_urdfs(
     return paths, scales_norm
 
 
+def generate_mesh_object_urdfs(
+    mesh_paths: tuple[str, ...],
+    out_dir: Union[str, Path] = "/tmp/play_assets",
+    object_base_size: float = _OBJECT_BASE_SIZE,
+    density: float = 500.0,
+) -> tuple[list[str], list[tuple[float, float, float]]]:
+    """Wrap explicit mesh files into P2P-compatible object URDFs.
+
+    Each mesh becomes one object: an ``object_root`` link whose visual and
+    collision geometry is the mesh, plus explicit trimesh-computed mass/inertia
+    at ``density``. Signature/return mirror ``generate_handle_head_urdfs`` so
+    ``setup_scene`` consumes it unchanged. ``object_scales_normalized`` is the
+    mesh axis-aligned bounding-box extent divided by ``object_base_size`` (the
+    play policy's geometry descriptor / keypoint scale).
+    """
+    import trimesh
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    paths: list[str] = []
+    scales_norm: list[tuple[float, float, float]] = []
+    for mesh_path in mesh_paths:
+        mesh_abs = Path(mesh_path).resolve()
+        mesh = trimesh.load(str(mesh_abs), force="mesh")
+        mesh.density = float(density)
+        m = float(mesh.mass)
+        inertia = mesh.moment_inertia  # (3,3) about centre of mass, local frame
+        ixx, iyy, izz = float(inertia[0, 0]), float(inertia[1, 1]), float(inertia[2, 2])
+        ixy, ixz, iyz = float(inertia[0, 1]), float(inertia[0, 2]), float(inertia[1, 2])
+        bx, by, bz = (float(v) for v in mesh.extents)  # AABB extents
+
+        name = mesh_abs.stem
+        urdf_path = out_dir / f"mesh_{name}.urdf"
+        urdf_path.write_text(
+            '<?xml version="1.0"?>\n'
+            f'<robot name="{name}">\n'
+            f'  <link name="{_OBJECT_ROOT_LINK}">\n'
+            "    <visual>\n"
+            '      <origin xyz="0 0 0" rpy="0 0 0"/>\n'
+            f'      <geometry><mesh filename="{mesh_abs}"/></geometry>\n'
+            "    </visual>\n"
+            "    <collision>\n"
+            '      <origin xyz="0 0 0" rpy="0 0 0"/>\n'
+            f'      <geometry><mesh filename="{mesh_abs}"/></geometry>\n'
+            "    </collision>\n"
+            "    <inertial>\n"
+            '      <origin xyz="0 0 0" rpy="0 0 0"/>\n'
+            f'      <mass value="{m}"/>\n'
+            f'      <inertia ixx="{ixx}" iyy="{iyy}" izz="{izz}" '
+            f'ixy="{ixy}" ixz="{ixz}" iyz="{iyz}"/>\n'
+            "    </inertial>\n"
+            "  </link>\n"
+            "</robot>\n"
+        )
+        paths.append(str(urdf_path))
+        scales_norm.append(
+            (bx / object_base_size, by / object_base_size, bz / object_base_size)
+        )
+    return paths, scales_norm
+
+
 __all__ = [
     "generate_handle_urdf",
     "generate_handle_head_urdf",

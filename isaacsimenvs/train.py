@@ -33,6 +33,15 @@ import math
 import os
 import sys
 
+# Default the CUDA caching allocator to expandable segments BEFORE torch inits it.
+# SAPG's variable-shape batching (off-policy augment + remainder minibatch/chunk
+# sizes) plus AMP churn fragments the default allocator: `reserved` memory creeps
+# up over hours until no contiguous block fits a new tensor -> CUDA OOM even though
+# `allocated` stays bounded (crash log showed ~4.3 GiB reserved-but-unallocated).
+# Expandable segments coalesce and curb this. `setdefault` so an explicit launch
+# env var still wins. Must run at import time (before AppLauncher/torch in main()).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 
 def main() -> None:
     from isaaclab.app import AppLauncher
