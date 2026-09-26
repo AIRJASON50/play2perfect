@@ -1,7 +1,7 @@
 """Train an isaacsimenvs task with our vendored rl_games.
 
 Pipeline:
-    argparse (--task, --agent, AppLauncher, wandb/video flags)
+    argparse (--task, --agent, AppLauncher, mlflow/video flags)
         ↓
     AppLauncher (boots Kit; must precede any isaaclab.* import)
         ↓
@@ -19,7 +19,7 @@ CLI shape:
         --task Isaacsimenvs-Play-Direct-v0 \
         --agent rl_games_sapg_cfg_entry_point \   # or rl_games_cfg_entry_point
         --headless --capture_viewer \
-        --wandb_activate --wandb_project X --wandb_name Y \
+        --mlflow_activate --mlflow_experiment X --mlflow_run_name Y \
         env.scene.num_envs=4096 \
         agent.params.config.max_epochs=200 \
         agent.params.config.minibatch_size=16384 \
@@ -80,7 +80,7 @@ def main() -> None:
     parser.add_argument("--capture_viewer_len", type=int, default=600)
     parser.add_argument("--capture_viewer_interval", type=int, default=6000)
     parser.add_argument("--capture_viewer_env_id", type=int, default=0)
-    parser.add_argument("--capture_viewer_wandb_key", default="interactive_viewer")
+    parser.add_argument("--capture_viewer_mlflow_key", default="interactive_viewer")
     parser.add_argument(
         "--capture_viewer_github_raw_base",
         default="",
@@ -92,15 +92,14 @@ def main() -> None:
         default="skip",
         help="Whether to HEAD-check the robot URDF URL before writing viewer HTML.",
     )
-    # --- wandb ---
-    parser.add_argument("--wandb_activate", action="store_true")
-    parser.add_argument("--wandb_project", default="isaacsimenvs")
-    parser.add_argument("--wandb_group", default="")
-    parser.add_argument("--wandb_entity", default="")
-    parser.add_argument("--wandb_name", default="", help="Defaults to agent_cfg.params.config.name")
-    parser.add_argument("--wandb_tags", nargs="*", default=[])
-    parser.add_argument("--wandb_notes", default="")
-    parser.add_argument("--wandb_logcode_dir", default="")
+    # --- mlflow (WUJI tracking server; URI + credentials read from the
+    # MLFLOW_TRACKING_URI / MLFLOW_TRACKING_USERNAME / MLFLOW_TRACKING_PASSWORD
+    # env vars by mlflow itself) ---
+    parser.add_argument("--mlflow_activate", action="store_true")
+    parser.add_argument("--mlflow_experiment", default="isaacsimenvs")
+    parser.add_argument(
+        "--mlflow_run_name", default="", help="Defaults to agent_cfg.params.config.name"
+    )
     # --- AppLauncher flags (--headless, --enable_cameras, etc.) ---
     AppLauncher.add_app_launcher_args(parser)
     args_cli, hydra_args = parser.parse_known_args()
@@ -117,7 +116,6 @@ def main() -> None:
     # 2. Safe to import isaaclab-backed modules now.
     import gymnasium as gym
     from hydra.core.hydra_config import HydraConfig
-    from omegaconf import OmegaConf
     from rl_games.torch_runner import Runner
 
     import isaacsimenvs  # noqa: F401  triggers gym.register side effects
@@ -173,7 +171,7 @@ def main() -> None:
                 capture_len=args_cli.capture_viewer_len,
                 capture_interval=args_cli.capture_viewer_interval,
                 env_id=args_cli.capture_viewer_env_id,
-                wandb_key=args_cli.capture_viewer_wandb_key,
+                mlflow_key=args_cli.capture_viewer_mlflow_key,
                 github_raw_base=args_cli.capture_viewer_github_raw_base,
                 url_check=args_cli.capture_viewer_url_check,
             )
@@ -191,25 +189,17 @@ def main() -> None:
         )
 
         observers = [EnvStatsAlgoObserver()]
-        if args_cli.wandb_activate:
-            from isaacsimenvs.utils.wandb_utils import WandbAlgoObserver
+        # MLflow is the only experiment tracker. Enabled with --mlflow_activate;
+        # server URI + credentials come from the MLFLOW_TRACKING_* env vars.
+        if args_cli.mlflow_activate:
+            from isaacsimenvs.utils.mlflow_utils import MlflowAlgoObserver
 
-            # WandbAlgoObserver expects attribute access (cfg.wandb_project,
-            # cfg.wandb_notes, …) and also passes cfg to omegaconf_to_dict
-            # for wandb.config upload. OmegaConf satisfies both.
-            wandb_cfg = OmegaConf.create(
-                {
-                    "wandb_activate": True,
-                    "wandb_project": args_cli.wandb_project,
-                    "wandb_group": args_cli.wandb_group,
-                    "wandb_entity": args_cli.wandb_entity,
-                    "wandb_name": args_cli.wandb_name or agent_cfg["params"]["config"]["name"],
-                    "wandb_tags": list(args_cli.wandb_tags),
-                    "wandb_notes": args_cli.wandb_notes,
-                    "wandb_logcode_dir": args_cli.wandb_logcode_dir,
-                }
+            observers.append(
+                MlflowAlgoObserver(
+                    experiment=args_cli.mlflow_experiment,
+                    run_name=args_cli.mlflow_run_name or agent_cfg["params"]["config"]["name"],
+                )
             )
-            observers.append(WandbAlgoObserver(wandb_cfg))
 
         runner = Runner(MultiObserver(observers))
         # Co-locate rl_games artifacts (checkpoints, summaries) with the Hydra

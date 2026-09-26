@@ -29,7 +29,7 @@ def log_step_metrics(env) -> None:
     env.extras["successes"] = env._prev_episode_successes.float()
     env.extras["current_success_tolerance"] = float(env._current_success_tolerance)
 
-    # --- Tracking-error (pos/angle) + success-rate scalars for wandb ---
+    # --- Tracking-error (pos/angle) + success-rate scalars for mlflow ---
     if hasattr(env, "object") and hasattr(env, "goal_viz"):
         obj_pos = env.object.data.root_pos_w
         goal_pos = env.goal_viz.data.root_pos_w

@@ -2,7 +2,7 @@
 
 This module deliberately does not use Isaac cameras, RTX sensors, Replicator, or
 the Isaac viewport.  It samples one environment's state tensors and writes a
-Three.js/URDF HTML viewer that can be opened locally or logged to WandB.
+Three.js/URDF HTML viewer that can be opened locally or logged to MLflow.
 """
 
 from __future__ import annotations
@@ -346,7 +346,7 @@ class PlayPoseViewerWrapper(gym.Wrapper):
         capture_len: int,
         capture_interval: int,
         env_id: int = 0,
-        wandb_key: str = "interactive_viewer",
+        mlflow_key: str = "interactive_viewer",
         github_raw_base: str | None = None,
         url_check: str = "skip",
     ) -> None:
@@ -364,7 +364,7 @@ class PlayPoseViewerWrapper(gym.Wrapper):
         self.capture_len = int(capture_len)
         self.capture_interval = int(capture_interval)
         self.env_id = int(env_id)
-        self.wandb_key = wandb_key
+        self.mlflow_key = mlflow_key
         self.github_raw_base = github_raw_base
         self.url_check = url_check
         self._object_urdf_text, self._object_urdf_path = object_urdf_for_env(
@@ -481,27 +481,27 @@ class PlayPoseViewerWrapper(gym.Wrapper):
         )
         html_path.write_text(html_text, encoding="utf-8")
         print(f"[pose_viewer] wrote {len(frames)} frames to {html_path}", flush=True)
-        self._log_wandb(html_text)
+        self._log_mlflow(html_text)
 
         self._capture_index += 1
         self._frames = None
         self._depth_frames = []
         self._depth_frames_clean = []
 
-    def _log_wandb(self, html_text: str) -> None:
+    def _log_mlflow(self, html_text: str) -> None:
         try:
-            import wandb
+            import mlflow
         except Exception:
             return
 
-        if wandb.run is None:
+        if mlflow.active_run() is None:
             return
 
         try:
-            wandb.log({self.wandb_key: wandb.Html(html_text)})
-            print(f"[pose_viewer] logged WandB Html key={self.wandb_key} step={self._step}", flush=True)
+            mlflow.log_text(html_text, f"{self.mlflow_key}/step_{self._step}.html")
+            print(f"[pose_viewer] logged MLflow HTML key={self.mlflow_key} step={self._step}", flush=True)
         except Exception as exc:
-            print(f"[pose_viewer] WandB log failed: {exc}", flush=True)
+            print(f"[pose_viewer] MLflow HTML log failed: {exc}", flush=True)
 
         if not self._depth_frames and not self._depth_frames_clean:
             return
@@ -512,17 +512,21 @@ class PlayPoseViewerWrapper(gym.Wrapper):
             video = np.stack(frames, axis=0)                        # (T, C, H, W) float in [0, 1]
             video = (np.clip(video, 0.0, 1.0) * 255.0).astype(np.uint8)
             if video.shape[1] == 1:
-                video = np.repeat(video, 3, axis=1)                 # (T, 3, H, W) for wandb.Video single-video tiling
+                video = np.repeat(video, 3, axis=1)                 # (T, 3, H, W)
             return video
 
         for label, frames in (("depth", self._depth_frames), ("depth_clean", self._depth_frames_clean)):
             if not frames:
                 continue
             try:
-                video = _to_uint8_grayscale_rgb(frames)
-                key = f"{self.wandb_key}_{label}"
-                wandb.log({key: wandb.Video(video, fps=30, format="mp4")})
-                print(f"[pose_viewer] logged WandB Video key={key} "
-                      f"shape={video.shape} dtype={video.dtype}", flush=True)
+                import imageio
+
+                video = _to_uint8_grayscale_rgb(frames)             # (T, 3, H, W)
+                path = str(self.output_dir / f"{self.mlflow_key}_{label}_step{self._step}.mp4")
+                imageio.mimwrite(
+                    path, np.transpose(video, (0, 2, 3, 1)), fps=30, macro_block_size=None
+                )
+                mlflow.log_artifact(path)
+                print(f"[pose_viewer] logged MLflow Video {label} -> {path}", flush=True)
             except Exception as exc:
-                print(f"[pose_viewer] WandB {label} video log failed: {exc}", flush=True)
+                print(f"[pose_viewer] MLflow {label} video log failed: {exc}", flush=True)
