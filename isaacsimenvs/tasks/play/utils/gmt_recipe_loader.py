@@ -234,59 +234,92 @@ def to_delta(waypoints: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def build_tracking_pool(
-    recipe: ResolvedGmtRecipe, goal_stride: int, *, max_goals: int = 0
+    recipe: ResolvedGmtRecipe,
+    goal_stride: int,
+    *,
+    table_z: float,
+    z_upper: float,
+    xy_half: tuple[float, float],
+    max_goals: int = 0,
 ) -> dict[str, np.ndarray]:
-    """Discretize every clip into first-frame-relative waypoint deltas, padded.
+    """Discretize clips into P2P world-frame tracking goals + workspace filter.
 
-    Returns numpy arrays ready to move onto the env device::
+    z is **table-aligned**: GMT world z=0 is the table, so the P2P goal height is
+    ``table_z + clip_z`` (preserves the object's real height above the table). xy
+    is **first-frame-relative** (absolute GMT xy has no physical meaning; anchored
+    to the object reset pose at runtime, keeping motion centered in the workspace).
 
-        traj_dp          (N_traj, max_K, 3) float32  position deltas vs frame 0
-        traj_dq          (N_traj, max_K, 4) float32  wxyz rotation deltas
-        traj_len         (N_traj,)          int64    real waypoint count per traj
-        traj_asset_index (N_traj,)          int64    mesh index (unique_mesh_paths order)
+    A clip is **dropped** if its table-aligned goal_z ever exceeds ``z_upper``
+    (arm can't reach that high) or its xy travel exceeds ``xy_half`` (leaves the
+    workspace). Returns padded numpy arrays::
 
-    Padding repeats each clip's last real waypoint so a clamped lookup holds at
-    the end. ``max_goals>0`` truncates over-long clips. ``traj_asset_index``
-    binds each trajectory to its geom (index into ``unique_mesh_paths``) so
-    stage-2 only replays a clip on the matching mesh.
+        traj_dxy         (N, max_K, 2) float32  xy delta vs first frame
+        traj_z           (N, max_K)    float32  clip z (height above table)
+        traj_dq          (N, max_K, 4) float32  wxyz rotation delta
+        traj_len         (N,)          int64    real waypoint count
+        traj_asset_index (N,)          int64    mesh index (unique_mesh_paths order)
+        n_total / n_kept                        filter stats (ints)
     """
     key_to_idx = {g.asset_key: i for i, g in enumerate(recipe.asset_groups)}
-    dps: list[np.ndarray] = []
+    dxys: list[np.ndarray] = []
+    zs: list[np.ndarray] = []
     dqs: list[np.ndarray] = []
     lens: list[int] = []
     aidx: list[int] = []
+    n_total = 0
     for g in recipe.asset_groups:
         idx = key_to_idx[g.asset_key]
         for clip in g.clips:
+            n_total += 1
             op = load_object_pose_trajectory(clip)
             wp = stride_sample(op, goal_stride)
-            dp, dq = to_delta(wp)
-            k = dp.shape[0]
+            z = wp[:, 2].astype(np.float32)  # height above GMT table (z=0)
+            dxy = (wp[:, :2] - wp[0:1, :2]).astype(np.float32)
+            _, dq = to_delta(wp)
+            k = z.shape[0]
             if max_goals > 0 and k > max_goals:
-                dp, dq, k = dp[:max_goals], dq[:max_goals], max_goals
-            dps.append(dp)
+                z, dxy, dq, k = z[:max_goals], dxy[:max_goals], dq[:max_goals], max_goals
+            # Workspace filter: table-aligned reach + xy travel.
+            if float((table_z + z).max()) > z_upper:
+                continue
+            if (
+                float(np.abs(dxy[:, 0]).max()) > xy_half[0]
+                or float(np.abs(dxy[:, 1]).max()) > xy_half[1]
+            ):
+                continue
+            dxys.append(dxy)
+            zs.append(z)
             dqs.append(dq)
             lens.append(k)
             aidx.append(idx)
-    if not lens:
-        raise ValueError("recipe produced no clips for the tracking pool")
 
-    n = len(lens)
+    n_kept = len(lens)
+    if n_kept == 0:
+        raise ValueError(
+            f"no clips survived the workspace filter (z_upper={z_upper}, "
+            f"xy_half={xy_half}); loosen the bounds or check table_z/recipe."
+        )
     max_k = max(lens)
-    traj_dp = np.zeros((n, max_k, 3), dtype=np.float32)
-    traj_dq = np.zeros((n, max_k, 4), dtype=np.float32)
-    traj_dq[..., 0] = 1.0  # identity-quat pad (safe if a lookup lands in padding)
-    for i, (dp, dq, k) in enumerate(zip(dps, dqs, lens)):
-        traj_dp[i, :k] = dp
+    traj_dxy = np.zeros((n_kept, max_k, 2), dtype=np.float32)
+    traj_z = np.zeros((n_kept, max_k), dtype=np.float32)
+    traj_dq = np.zeros((n_kept, max_k, 4), dtype=np.float32)
+    traj_dq[..., 0] = 1.0  # identity-quat pad
+    for i, (dxy, z, dq, k) in enumerate(zip(dxys, zs, dqs, lens)):
+        traj_dxy[i, :k] = dxy
+        traj_z[i, :k] = z
         traj_dq[i, :k] = dq
         if k < max_k:
-            traj_dp[i, k:] = dp[-1]
+            traj_dxy[i, k:] = dxy[-1]
+            traj_z[i, k:] = z[-1]
             traj_dq[i, k:] = dq[-1]
     return {
-        "traj_dp": traj_dp,
+        "traj_dxy": traj_dxy,
+        "traj_z": traj_z,
         "traj_dq": traj_dq,
         "traj_len": np.asarray(lens, dtype=np.int64),
         "traj_asset_index": np.asarray(aidx, dtype=np.int64),
+        "n_total": n_total,
+        "n_kept": n_kept,
     }
 
 

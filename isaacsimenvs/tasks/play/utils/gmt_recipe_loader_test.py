@@ -151,19 +151,24 @@ def test_build_tracking_pool_shapes() -> None:
     mini = replace(
         r, asset_groups=tuple(replace(g, clips=g.clips[:1]) for g in r.asset_groups[:2])
     )
-    pool = build_tracking_pool(mini, goal_stride=25)
-    assert pool["traj_dp"].shape[0] == 2 and pool["traj_dq"].shape[0] == 2
-    assert pool["traj_len"].shape == (2,)
-    # asset_index must index into the mini mesh list (0 or 1), one per source asset
-    assert sorted(pool["traj_asset_index"].tolist()) == [0, 1]
-    max_k = pool["traj_dp"].shape[1]
-    for i in range(2):
+    # wide z_upper so both mini clips survive the filter (structure test).
+    pool = build_tracking_pool(
+        mini, goal_stride=25, table_z=0.38, z_upper=2.0, xy_half=(0.35, 0.20)
+    )
+    assert pool["n_total"] == 2
+    n = pool["n_kept"]
+    assert 1 <= n <= 2
+    assert pool["traj_dxy"].shape[0] == n and pool["traj_z"].shape[0] == n
+    assert pool["traj_dq"].shape[0] == n and pool["traj_len"].shape == (n,)
+    assert set(pool["traj_asset_index"].tolist()) <= {0, 1}
+    max_k = pool["traj_dxy"].shape[1]
+    for i in range(n):
         length = int(pool["traj_len"][i])
-        assert np.allclose(pool["traj_dp"][i, 0], 0.0)
+        assert np.allclose(pool["traj_dxy"][i, 0], 0.0)  # xy delta starts at 0
         assert np.allclose(pool["traj_dq"][i, 0], [1, 0, 0, 0], atol=1e-5)
         if length < max_k:  # padding holds the last real waypoint
-            assert np.allclose(pool["traj_dp"][i, -1], pool["traj_dp"][i, length - 1])
-            assert np.allclose(pool["traj_dq"][i, length:], pool["traj_dq"][i, length - 1], atol=1e-6)
+            assert np.allclose(pool["traj_dxy"][i, -1], pool["traj_dxy"][i, length - 1])
+            assert np.allclose(pool["traj_z"][i, length:], pool["traj_z"][i, length - 1])
 
 
 if __name__ == "__main__":

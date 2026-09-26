@@ -434,6 +434,10 @@ class ResetCfg:
     # reset orientation as the anchor.
     tracking_anchor_orientation: str = "identity"  # "identity" | "reset_pose"
     tracking_max_goals: int = 0  # >0 truncates long clips (0 = data-decided max_K)
+    # Workspace filter (recipe stage): drop clips whose table-aligned goal_z ever
+    # exceeds this (arm can't reach). clip z = height above the GMT table (z=0),
+    # goal_z = table_reset_z + clip_z.
+    tracking_z_upper: float = 0.9
 
 
 # ----------------------------------------------------------------------------

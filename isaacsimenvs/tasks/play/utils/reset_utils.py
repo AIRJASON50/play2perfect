@@ -219,18 +219,35 @@ def _allocate_tracking_pool(env) -> None:
             "(env._gmt_recipe is unset)."
         )
     cfg = env.cfg.reset
-    pool = build_tracking_pool(recipe, cfg.goal_stride, max_goals=cfg.tracking_max_goals)
+    # xy workspace half-extent = target_volume half-widths (motion recentered on env).
+    xy_half = (float(cfg.target_volume_maxs[0]), float(cfg.target_volume_maxs[1]))
+    pool = build_tracking_pool(
+        recipe,
+        cfg.goal_stride,
+        table_z=float(cfg.table_reset_z),
+        z_upper=float(cfg.tracking_z_upper),
+        xy_half=xy_half,
+        max_goals=cfg.tracking_max_goals,
+    )
+    print(
+        f"[tracking pool] kept {pool['n_kept']}/{pool['n_total']} clips after "
+        f"workspace filter (goal_z<={cfg.tracking_z_upper}, xy_half={xy_half}, "
+        f"goal_stride={cfg.goal_stride})",
+        flush=True,
+    )
     dev = env.device
-    env._traj_dp = torch.as_tensor(pool["traj_dp"], device=dev)  # (N, K, 3)
+    env._traj_dxy = torch.as_tensor(pool["traj_dxy"], device=dev)  # (N, K, 2) xy delta
+    env._traj_z = torch.as_tensor(pool["traj_z"], device=dev)  # (N, K) height above table
     env._traj_dq = torch.as_tensor(pool["traj_dq"], device=dev)  # (N, K, 4) wxyz
     env._traj_len = torch.as_tensor(pool["traj_len"], device=dev)  # (N,)
     traj_asset_index = torch.as_tensor(pool["traj_asset_index"], device=dev)  # (N,)
 
-    n_traj = env._traj_dp.shape[0]
+    n_traj = env._traj_dxy.shape[0]
     env._traj_id = torch.zeros(env.num_envs, dtype=torch.long, device=dev)
     env._traj_step = torch.zeros(env.num_envs, dtype=torch.long, device=dev)
-    # Per-episode anchor (object reset pose) the clip deltas are added onto.
-    env._traj_anchor_pos = torch.zeros(env.num_envs, 3, device=dev)
+    # Per-episode anchor: xy (object reset xy) + orientation. z is table-aligned
+    # per waypoint (table_reset_z + clip z), not anchored to the reset height.
+    env._traj_anchor_xy = torch.zeros(env.num_envs, 2, device=dev)
     env._traj_anchor_quat = torch.zeros(env.num_envs, 4, device=dev)
     env._traj_anchor_quat[:, 0] = 1.0
 
@@ -353,15 +370,25 @@ def _reset_object_pose(env, env_ids: torch.Tensor) -> None:
         )
         quat = random_orientation(n, device=env.device)
 
-    # Tracking (stage 2): anchor the clip deltas onto this reset pose. "identity"
-    # orientation makes the goal quats equal the clip's first-frame-relative
-    # rotation (object starts at identity, follows the clip); "reset_pose" keeps
-    # the sampled quat as anchor.
+    # Tracking (stage 2): sample the clip here so the object reset z can be
+    # table-aligned to the clip's first frame (goal_z = table + clip_z), and the
+    # goal step-0 lands exactly on the object reset pose. xy stays at the reset
+    # noise (workspace-centered); the clip's xy delta is anchored onto it.
     if cfg.tracking_enabled:
+        mesh_idx = env._object_asset_index_per_env[env_ids]  # (n,)
+        cnt = env._traj_count_per_mesh[mesh_idx]  # (n,)
+        choice = torch.minimum(
+            (torch.rand(n, device=env.device) * cnt.float()).long(), cnt - 1
+        )
+        env._traj_id[env_ids] = env._traj_ids_by_mesh[mesh_idx, choice]
+        env._traj_step[env_ids] = 0
+        tid = env._traj_id[env_ids]
         if cfg.tracking_anchor_orientation == "identity":
             quat = torch.zeros(n, 4, device=env.device)
             quat[:, 0] = 1.0
-        env._traj_anchor_pos[env_ids] = pos_local
+        pos_local = pos_local.clone()
+        pos_local[:, 2] = env._table_z_per_env[env_ids] + env._traj_z[tid, 0]
+        env._traj_anchor_xy[env_ids] = pos_local[:, :2]
         env._traj_anchor_quat[env_ids] = quat
 
     pose = torch.cat([pos_local + env_origins, quat], dim=-1)
@@ -388,25 +415,22 @@ def _reset_goal_pose(env, env_ids: torch.Tensor, mode: str) -> None:
         return
 
     # GMT object-trajectory tracking (stage 2): goals follow the clip's discrete
-    # waypoints, anchored on this episode's object reset pose. mode is the
-    # hard-reset (absolute -> new clip matching this env's mesh, step 0) vs
-    # intra-episode goal-hit (advance step) signal, same convention as the
-    # fixed-trajectory path below.
+    # waypoints. The clip is sampled in _reset_object_pose (so object z is table-
+    # aligned and goal step-0 == object reset pose). Here: absolute (hard reset)
+    # keeps step 0; anything else (intra-episode goal-hit) advances the step.
+    # Goal xy = reset-anchor xy + clip xy delta; z = table + clip z (table-
+    # aligned, per-env table height); quat = clip rotation delta (x) anchor quat.
     if cfg.tracking_enabled:
-        if mode == "absolute":
-            mesh_idx = env._object_asset_index_per_env[env_ids]  # (n,)
-            cnt = env._traj_count_per_mesh[mesh_idx]  # (n,)
-            choice = (torch.rand(n, device=env.device) * cnt.float()).long()
-            choice = torch.minimum(choice, cnt - 1)
-            env._traj_id[env_ids] = env._traj_ids_by_mesh[mesh_idx, choice]
-            env._traj_step[env_ids] = 0
-        else:
+        if mode != "absolute":
             env._traj_step[env_ids] = env._traj_step[env_ids] + 1
         traj_id = env._traj_id[env_ids]
         step = torch.minimum(env._traj_step[env_ids], env._traj_len[traj_id] - 1)
-        dp = env._traj_dp[traj_id, step]  # (n, 3)
+        dxy = env._traj_dxy[traj_id, step]  # (n, 2)
+        z = env._traj_z[traj_id, step]  # (n,)
         dq = env._traj_dq[traj_id, step]  # (n, 4) wxyz
-        goal_pos_local = env._traj_anchor_pos[env_ids] + dp
+        goal_xy = env._traj_anchor_xy[env_ids] + dxy
+        goal_z = (env._table_z_per_env[env_ids] + z).unsqueeze(-1)
+        goal_pos_local = torch.cat([goal_xy, goal_z], dim=-1)
         goal_quat = quat_mul(dq, env._traj_anchor_quat[env_ids])  # dq (x) anchor
         pose = torch.cat([goal_pos_local + env_origins, goal_quat], dim=-1)
         env.goal_viz.write_root_pose_to_sim(pose, env_ids=env_ids)
