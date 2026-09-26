@@ -45,6 +45,10 @@ def log_step_metrics(env) -> None:
         env.extras["track_angle_error_median_deg"] = ang_err.median().item() * 57.2957795
     if hasattr(env, "_is_success"):
         env.extras["success_rate"] = env._is_success.float().mean().item()
+    if getattr(env, "_is_track_complete", None) is not None:
+        env.extras["track_follow_complete_rate"] = (
+            env._is_track_complete.float().mean().item()
+        )
 
 
 __all__ = ["log_step_metrics"]

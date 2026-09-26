@@ -54,7 +54,11 @@ def compute_terminations(env) -> tuple[torch.Tensor, torch.Tensor]:
     object_z_local = env.object.data.root_pos_w[:, 2] - env_origins[:, 2]
     fall = object_z_local < 0.1
 
-    if term_cfg.max_consecutive_successes > 0:
+    if env.cfg.reset.tracking_enabled:
+        # "follow complete" = reached every sampled waypoint of this env's clip.
+        env._is_track_complete = env._successes >= env._traj_len[env._traj_id]
+        max_successes_reached = env._is_track_complete
+    elif term_cfg.max_consecutive_successes > 0:
         max_successes_reached = env._successes >= term_cfg.max_consecutive_successes
     else:
         max_successes_reached = torch.zeros_like(fall)

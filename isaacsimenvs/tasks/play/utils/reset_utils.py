@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from isaaclab.utils.math import random_orientation
+from isaaclab.utils.math import quat_mul, random_orientation
 
 from .action_utils import sample_log_uniform
 from .goal_sampling import sample_absolute_goal_pose, sample_delta_goal_pose
@@ -193,8 +193,69 @@ def allocate_state_buffers(env) -> None:
         env._traj_id = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
         env._traj_step = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
 
+    # --- GMT object-trajectory tracking pool (stage 2) ---
+    if env.cfg.reset.tracking_enabled:
+        _allocate_tracking_pool(env)
+
     # set the reward buffer to 0
     env.reward_buf = torch.zeros(env.num_envs, device=env.device)
+
+
+def _allocate_tracking_pool(env) -> None:
+    """Build stage-2 object-trajectory tracking buffers from the recipe.
+
+    Requires ``env._gmt_recipe`` (set by setup_scene when assets.object_recipe is
+    used) and ``env._object_asset_index_per_env`` (per-env mesh index, already
+    populated since setup_scene ran before allocate). Discretizes every clip into
+    padded first-frame-relative waypoint deltas and binds each trajectory to its
+    mesh so an env only ever replays clips recorded on its own geom.
+    """
+    from .gmt_recipe_loader import build_tracking_pool
+
+    recipe = getattr(env, "_gmt_recipe", None)
+    if recipe is None:
+        raise ValueError(
+            "reset.tracking_enabled requires assets.object_recipe "
+            "(env._gmt_recipe is unset)."
+        )
+    cfg = env.cfg.reset
+    pool = build_tracking_pool(recipe, cfg.goal_stride, max_goals=cfg.tracking_max_goals)
+    dev = env.device
+    env._traj_dp = torch.as_tensor(pool["traj_dp"], device=dev)  # (N, K, 3)
+    env._traj_dq = torch.as_tensor(pool["traj_dq"], device=dev)  # (N, K, 4) wxyz
+    env._traj_len = torch.as_tensor(pool["traj_len"], device=dev)  # (N,)
+    traj_asset_index = torch.as_tensor(pool["traj_asset_index"], device=dev)  # (N,)
+
+    n_traj = env._traj_dp.shape[0]
+    env._traj_id = torch.zeros(env.num_envs, dtype=torch.long, device=dev)
+    env._traj_step = torch.zeros(env.num_envs, dtype=torch.long, device=dev)
+    # Per-episode anchor (object reset pose) the clip deltas are added onto.
+    env._traj_anchor_pos = torch.zeros(env.num_envs, 3, device=dev)
+    env._traj_anchor_quat = torch.zeros(env.num_envs, 4, device=dev)
+    env._traj_anchor_quat[:, 0] = 1.0
+
+    # Padded (num_mesh, max_per_mesh) id table so reset can sample a trajectory
+    # matching each env's mesh in a vectorized way.
+    num_mesh = int(env._object_asset_index_per_env.max().item()) + 1
+    ids_by_mesh: list[list[int]] = [[] for _ in range(num_mesh)]
+    for t in range(n_traj):
+        m = int(traj_asset_index[t].item())
+        if m < num_mesh:
+            ids_by_mesh[m].append(t)
+    counts = [len(v) for v in ids_by_mesh]
+    if min(counts) == 0:
+        missing = [m for m, c in enumerate(counts) if c == 0]
+        raise ValueError(
+            f"tracking pool has no trajectory for mesh index(es) {missing}; "
+            "every spawned geom must have at least one clip in the recipe."
+        )
+    max_per = max(counts)
+    table = torch.zeros(num_mesh, max_per, dtype=torch.long, device=dev)
+    for m, v in enumerate(ids_by_mesh):
+        table[m, : len(v)] = torch.as_tensor(v, device=dev)
+    env._traj_ids_by_mesh = table  # (num_mesh, max_per)
+    env._traj_count_per_mesh = torch.as_tensor(counts, device=dev)  # (num_mesh,)
+    env._is_track_complete = torch.zeros(env.num_envs, dtype=torch.bool, device=dev)
 
 
 def _randomize_robot_dof_state(env, env_ids: torch.Tensor) -> None:
@@ -292,6 +353,17 @@ def _reset_object_pose(env, env_ids: torch.Tensor) -> None:
         )
         quat = random_orientation(n, device=env.device)
 
+    # Tracking (stage 2): anchor the clip deltas onto this reset pose. "identity"
+    # orientation makes the goal quats equal the clip's first-frame-relative
+    # rotation (object starts at identity, follows the clip); "reset_pose" keeps
+    # the sampled quat as anchor.
+    if cfg.tracking_enabled:
+        if cfg.tracking_anchor_orientation == "identity":
+            quat = torch.zeros(n, 4, device=env.device)
+            quat[:, 0] = 1.0
+        env._traj_anchor_pos[env_ids] = pos_local
+        env._traj_anchor_quat[env_ids] = quat
+
     pose = torch.cat([pos_local + env_origins, quat], dim=-1)
     env.object.write_root_pose_to_sim(pose, env_ids=env_ids)
     env.object.write_root_velocity_to_sim(
@@ -312,6 +384,31 @@ def _reset_goal_pose(env, env_ids: torch.Tensor, mode: str) -> None:
         new_pos_local = fixed[:3].unsqueeze(0).expand(n, -1)
         new_quat = fixed[3:].unsqueeze(0).expand(n, -1)
         pose = torch.cat([new_pos_local + env_origins, new_quat], dim=-1)
+        env.goal_viz.write_root_pose_to_sim(pose, env_ids=env_ids)
+        return
+
+    # GMT object-trajectory tracking (stage 2): goals follow the clip's discrete
+    # waypoints, anchored on this episode's object reset pose. mode is the
+    # hard-reset (absolute -> new clip matching this env's mesh, step 0) vs
+    # intra-episode goal-hit (advance step) signal, same convention as the
+    # fixed-trajectory path below.
+    if cfg.tracking_enabled:
+        if mode == "absolute":
+            mesh_idx = env._object_asset_index_per_env[env_ids]  # (n,)
+            cnt = env._traj_count_per_mesh[mesh_idx]  # (n,)
+            choice = (torch.rand(n, device=env.device) * cnt.float()).long()
+            choice = torch.minimum(choice, cnt - 1)
+            env._traj_id[env_ids] = env._traj_ids_by_mesh[mesh_idx, choice]
+            env._traj_step[env_ids] = 0
+        else:
+            env._traj_step[env_ids] = env._traj_step[env_ids] + 1
+        traj_id = env._traj_id[env_ids]
+        step = torch.minimum(env._traj_step[env_ids], env._traj_len[traj_id] - 1)
+        dp = env._traj_dp[traj_id, step]  # (n, 3)
+        dq = env._traj_dq[traj_id, step]  # (n, 4) wxyz
+        goal_pos_local = env._traj_anchor_pos[env_ids] + dp
+        goal_quat = quat_mul(dq, env._traj_anchor_quat[env_ids])  # dq (x) anchor
+        pose = torch.cat([goal_pos_local + env_origins, goal_quat], dim=-1)
         env.goal_viz.write_root_pose_to_sim(pose, env_ids=env_ids)
         return
 

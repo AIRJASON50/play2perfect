@@ -421,6 +421,20 @@ class ResetCfg:
     fixed_trajectory_file: str = ""
     fixed_trajectory_count: int = 0
 
+    # GMT object-trajectory tracking (stage 2). When tracking_enabled, goals come
+    # from the recipe's per-clip object_pose_w discretized every goal_stride
+    # frames into first-frame-relative waypoints, anchored onto each episode's
+    # object reset pose (see gmt_recipe_loader.build_tracking_pool). Requires
+    # assets.object_recipe. False (default) = byte-identical legacy behavior.
+    tracking_enabled: bool = False
+    goal_stride: int = 25  # sub-sample the 50 fps clip: one goal per N frames
+    # Object initial orientation for tracking: "identity" makes each goal quat
+    # equal the clip's first-frame-relative rotation (object starts at identity
+    # and follows the clip's relative motion); "reset_pose" keeps the random
+    # reset orientation as the anchor.
+    tracking_anchor_orientation: str = "identity"  # "identity" | "reset_pose"
+    tracking_max_goals: int = 0  # >0 truncates long clips (0 = data-decided max_K)
+
 
 # ----------------------------------------------------------------------------
 # termination (includes tolerance curriculum — governs success criterion)

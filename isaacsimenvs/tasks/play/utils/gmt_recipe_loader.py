@@ -233,6 +233,63 @@ def to_delta(waypoints: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return dp.astype(np.float32), dq.astype(np.float32)
 
 
+def build_tracking_pool(
+    recipe: ResolvedGmtRecipe, goal_stride: int, *, max_goals: int = 0
+) -> dict[str, np.ndarray]:
+    """Discretize every clip into first-frame-relative waypoint deltas, padded.
+
+    Returns numpy arrays ready to move onto the env device::
+
+        traj_dp          (N_traj, max_K, 3) float32  position deltas vs frame 0
+        traj_dq          (N_traj, max_K, 4) float32  wxyz rotation deltas
+        traj_len         (N_traj,)          int64    real waypoint count per traj
+        traj_asset_index (N_traj,)          int64    mesh index (unique_mesh_paths order)
+
+    Padding repeats each clip's last real waypoint so a clamped lookup holds at
+    the end. ``max_goals>0`` truncates over-long clips. ``traj_asset_index``
+    binds each trajectory to its geom (index into ``unique_mesh_paths``) so
+    stage-2 only replays a clip on the matching mesh.
+    """
+    key_to_idx = {g.asset_key: i for i, g in enumerate(recipe.asset_groups)}
+    dps: list[np.ndarray] = []
+    dqs: list[np.ndarray] = []
+    lens: list[int] = []
+    aidx: list[int] = []
+    for g in recipe.asset_groups:
+        idx = key_to_idx[g.asset_key]
+        for clip in g.clips:
+            op = load_object_pose_trajectory(clip)
+            wp = stride_sample(op, goal_stride)
+            dp, dq = to_delta(wp)
+            k = dp.shape[0]
+            if max_goals > 0 and k > max_goals:
+                dp, dq, k = dp[:max_goals], dq[:max_goals], max_goals
+            dps.append(dp)
+            dqs.append(dq)
+            lens.append(k)
+            aidx.append(idx)
+    if not lens:
+        raise ValueError("recipe produced no clips for the tracking pool")
+
+    n = len(lens)
+    max_k = max(lens)
+    traj_dp = np.zeros((n, max_k, 3), dtype=np.float32)
+    traj_dq = np.zeros((n, max_k, 4), dtype=np.float32)
+    traj_dq[..., 0] = 1.0  # identity-quat pad (safe if a lookup lands in padding)
+    for i, (dp, dq, k) in enumerate(zip(dps, dqs, lens)):
+        traj_dp[i, :k] = dp
+        traj_dq[i, :k] = dq
+        if k < max_k:
+            traj_dp[i, k:] = dp[-1]
+            traj_dq[i, k:] = dq[-1]
+    return {
+        "traj_dp": traj_dp,
+        "traj_dq": traj_dq,
+        "traj_len": np.asarray(lens, dtype=np.int64),
+        "traj_asset_index": np.asarray(aidx, dtype=np.int64),
+    }
+
+
 __all__ = [
     "GmtClip",
     "GmtAssetGroup",
@@ -242,6 +299,7 @@ __all__ = [
     "load_object_pose_trajectory",
     "stride_sample",
     "to_delta",
+    "build_tracking_pool",
     "quat_inv",
     "quat_mul",
 ]
